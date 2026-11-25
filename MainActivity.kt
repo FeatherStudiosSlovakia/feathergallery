@@ -122,6 +122,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
+import java.nio.ByteBuffer
 import java.text.SimpleDateFormat
 import java.util.*
 import kotlin.math.abs
@@ -402,6 +403,108 @@ suspend fun loadVideoThumbnailBitmap(context: Context, uri: Uri, highRes: Boolea
         bitmap
     }
 
+// ----------------------------------------------------
+// EXTRAKCIA JPEG NÁHĽADU Z PSD (BEZ EXTERNÝCH KNIŽNÍC)
+// ----------------------------------------------------
+suspend fun extractPsdThumbnail(context: Context, uri: Uri): Bitmap? = withContext(Dispatchers.IO) {
+    try {
+        context.contentResolver.openInputStream(uri)?.use { stream ->
+            val header = ByteArray(26)
+            if (stream.read(header) != 26) return@withContext null
+            val sig = String(header.copyOfRange(0, 4))
+            if (sig != "8BPS") return@withContext null // Nie je to PSD
+
+            // Preskočíme Color Mode Data
+            val colorModeLenBytes = ByteArray(4)
+            if (stream.read(colorModeLenBytes) != 4) return@withContext null
+            val colorModeLen = ByteBuffer.wrap(colorModeLenBytes).int
+            stream.skip(colorModeLen.toLong())
+
+            // Image Resources
+            val resLenBytes = ByteArray(4)
+            if (stream.read(resLenBytes) != 4) return@withContext null
+            var resLen = ByteBuffer.wrap(resLenBytes).int
+
+            while (resLen > 0) {
+                val blockSigBytes = ByteArray(4)
+                if (stream.read(blockSigBytes) != 4) break
+                val blockSig = String(blockSigBytes)
+                if (blockSig != "8BIM" && blockSig != "MeSa") break
+
+                val idBytes = ByteArray(2)
+                if (stream.read(idBytes) != 2) break
+                val id = ByteBuffer.wrap(idBytes).short.toInt()
+
+                var nameLen = stream.read()
+                if (nameLen == -1) break
+
+                // Pascal string, doplnený na párny počet bajtov
+                val padding = if ((1 + nameLen) % 2 != 0) 1 else 0
+                val bytesToSkip = nameLen + padding
+                stream.skip(bytesToSkip.toLong())
+
+                val sizeBytes = ByteArray(4)
+                if (stream.read(sizeBytes) != 4) break
+                val size = ByteBuffer.wrap(sizeBytes).int
+                val paddedSize = size + (size % 2)
+
+                // ID 1036 je štandardný thumbnail, 1033 je zo starších verzií
+                if (id == 1036 || id == 1033) {
+                    val formatBytes = ByteArray(4)
+                    if (stream.read(formatBytes) == 4) {
+                        val format = ByteBuffer.wrap(formatBytes).int
+                        if (format == 1) { // 1 = JPEG formát
+                            stream.skip(24) // Skip width(4), height(4), widthBytes(4), totalSize(4), compressedSize(4), bpp(2), planes(2)
+                            val jpegSize = size - 28
+                            if (jpegSize > 0) {
+                                val jpegData = ByteArray(jpegSize)
+                                stream.read(jpegData)
+                                return@withContext BitmapFactory.decodeByteArray(jpegData, 0, jpegSize)
+                            }
+                        }
+                    }
+                    return@withContext null
+                } else {
+                    stream.skip(paddedSize.toLong())
+                }
+                resLen -= (4 + 2 + 1 + bytesToSkip + 4 + paddedSize)
+            }
+        }
+    } catch (e: Exception) {
+        e.printStackTrace()
+    }
+    null
+}
+
+// ----------------------------------------------------
+// EXTRAKCIA JPEG XL (JXL) NÁHĽADU (Cez natívne API)
+// ----------------------------------------------------
+suspend fun extractJxlThumbnail(context: Context, uri: Uri): Bitmap? = withContext(Dispatchers.IO) {
+    try {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            return@withContext context.contentResolver.loadThumbnail(uri, Size(1200, 1200), null)
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            val source = ImageDecoder.createSource(context.contentResolver, uri)
+            return@withContext ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
+                decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+                val w = info.size.width
+                val h = info.size.height
+                if (w > 1200 || h > 1200) {
+                    val scale = 1200.toFloat() / max(w, h).toFloat()
+                    decoder.setTargetSize((w * scale).roundToInt().coerceAtLeast(1), (h * scale).roundToInt().coerceAtLeast(1))
+                }
+            }
+        } else {
+            context.contentResolver.openInputStream(uri)?.use { stream ->
+                return@withContext BitmapFactory.decodeStream(stream)
+            }
+        }
+    } catch (e: Exception) {
+        e.printStackTrace()
+    }
+    null
+}
+
 @Composable
 fun SmartMediaImage(
     uri: Uri,
@@ -413,6 +516,9 @@ fun SmartMediaImage(
 ) {
     val version = editedPhotoCacheVersion
     val editedBitmap = remember(uri, version) { editedPhotoCache.get(uri.toString()) }
+    val isVideo = mimeType.startsWith("video/")
+    val isPsd = mimeType.contains("photoshop") || uri.toString().endsWith(".psd", true) || mimeType.contains("psd")
+    val isJxl = mimeType.contains("jxl") || uri.toString().endsWith(".jxl", true)
 
     if (editedBitmap != null) {
         Image(
@@ -421,7 +527,38 @@ fun SmartMediaImage(
             modifier = modifier,
             contentScale = contentScale
         )
-    } else if (!mimeType.startsWith("video/")) {
+    } else if (isPsd || isJxl) {
+        val context = LocalContext.current
+        val cacheKey = if (isPsd) "psd_$uri" else "jxl_$uri"
+        var bitmap by remember(uri) { mutableStateOf(videoThumbnailCache.get(cacheKey)) }
+
+        LaunchedEffect(uri) {
+            if (bitmap == null) {
+                val extracted = if (isPsd) extractPsdThumbnail(context, uri) else extractJxlThumbnail(context, uri)
+                if (extracted != null) {
+                    videoThumbnailCache.put(cacheKey, extracted)
+                    bitmap = extracted
+                }
+            }
+        }
+
+        if (bitmap != null) {
+            Image(
+                bitmap = bitmap!!.asImageBitmap(),
+                contentDescription = contentDescription,
+                modifier = modifier,
+                contentScale = contentScale
+            )
+        } else {
+            // Fallback pre PSD / JXL bez uloženého náhľadu (alebo nepodporovaného Androidom < 14)
+            Box(
+                modifier = modifier.background(Color.DarkGray),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(if (isPsd) "PSD" else "JXL", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+            }
+        }
+    } else if (!isVideo) {
         AsyncImage(
             model = uri,
             contentDescription = contentDescription,
@@ -695,7 +832,21 @@ suspend fun loadEditableBitmap(context: Context, uri: Uri, maxDimension: Int = 2
         editedPhotoCache.get(uri.toString())?.let { cached ->
             return@withContext cached.copy(Bitmap.Config.ARGB_8888, true)
         }
+
         try {
+            val mimeType = context.contentResolver.getType(uri) ?: ""
+            val isPsd = mimeType.contains("photoshop") || uri.toString().endsWith(".psd", true) || mimeType.contains("psd")
+            val isJxl = mimeType.contains("jxl") || uri.toString().endsWith(".jxl", true)
+
+            if (isPsd) {
+                val psdBmp = extractPsdThumbnail(context, uri)
+                if (psdBmp != null) return@withContext psdBmp
+            }
+            if (isJxl) {
+                val jxlBmp = extractJxlThumbnail(context, uri)
+                if (jxlBmp != null) return@withContext jxlBmp
+            }
+
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                 val source = ImageDecoder.createSource(context.contentResolver, uri)
                 ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
@@ -915,7 +1066,7 @@ suspend fun renderFinalEditedBitmap(
     result
 }
 
-// Spoľahlivé uloženie novej kópie pre staršie (< Android 10) aj novšie (Android 10–15+) verzie
+@android.annotation.SuppressLint("NewApi")
 suspend fun saveBitmapAsNewCopy(
     context: Context,
     bitmap: Bitmap,
@@ -1620,6 +1771,7 @@ fun PillNavItem(
 // CELOOBRAZOVKOVÝ REŽIM
 // ----------------------------------------------------
 @OptIn(ExperimentalMaterial3Api::class)
+@android.annotation.SuppressLint("NewApi")
 @Composable
 fun FullScreenPhotoView(
     photos: List<MediaPhoto>,
@@ -1698,11 +1850,13 @@ fun FullScreenPhotoView(
             } catch (e: SecurityException) {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     val recoverable = e as? RecoverableSecurityException
-                    recoverable?.let {
+                    if (recoverable != null) {
                         deleteLauncher.launch(
-                            IntentSenderRequest.Builder(it.userAction.actionIntent.intentSender).build()
+                            IntentSenderRequest.Builder(recoverable.userAction.actionIntent.intentSender).build()
                         )
-                    } ?: Toast.makeText(context, msgDeleteError, Toast.LENGTH_SHORT).show()
+                    } else {
+                        Toast.makeText(context, msgDeleteError, Toast.LENGTH_SHORT).show()
+                    }
                 } else {
                     Toast.makeText(context, msgDeleteError, Toast.LENGTH_SHORT).show()
                 }
@@ -2527,6 +2681,7 @@ fun FullScreenPhotoView(
 // KOMPONENT: PLNOHODNOTNÝ FOTO EDITOR (FEATHER STUDIOS)
 // ----------------------------------------------------
 @OptIn(ExperimentalMaterial3Api::class)
+@android.annotation.SuppressLint("NewApi")
 @Composable
 fun FullPhotoEditorModal(
     photo: MediaPhoto,
@@ -4052,10 +4207,23 @@ fun FullPhotoEditorModal(
                                         overwritePermissionLauncher.launch(
                                             IntentSenderRequest.Builder(writeIntent).build()
                                         )
-                                    } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && secEx is RecoverableSecurityException) {
-                                        overwritePermissionLauncher.launch(
-                                            IntentSenderRequest.Builder(secEx.userAction.actionIntent.intentSender).build()
-                                        )
+                                    } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                                        val recoverable = secEx as? RecoverableSecurityException
+                                        if (recoverable != null) {
+                                            overwritePermissionLauncher.launch(
+                                                IntentSenderRequest.Builder(recoverable.userAction.actionIntent.intentSender).build()
+                                            )
+                                        } else {
+                                            val savedCopyFallback = saveBitmapAsNewCopy(context, finalBmp, photo)
+                                            isSaving = false
+                                            pendingOverwriteBitmap = null
+                                            if (savedCopyFallback) {
+                                                Toast.makeText(context, msgSavedCopy, Toast.LENGTH_SHORT).show()
+                                                onSaved()
+                                            } else {
+                                                Toast.makeText(context, msgSaveError, Toast.LENGTH_SHORT).show()
+                                            }
+                                        }
                                     } else {
                                         val savedCopyFallback = saveBitmapAsNewCopy(context, finalBmp, photo)
                                         isSaving = false
@@ -4094,6 +4262,7 @@ fun FullPhotoEditorModal(
 // OBRAZOVKA FOTIEK S VÝBEROM A PODPOROU HLAVIČIEK
 // ----------------------------------------------------
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
+@android.annotation.SuppressLint("NewApi")
 @Composable
 fun PhotosScreenWithFilters(
     allPhotos: List<MediaPhoto>,
@@ -4150,7 +4319,7 @@ fun PhotosScreenWithFilters(
         if (gridState.isScrollInProgress || isDraggingScrollbar) {
             isScrollbarVisible = true
         } else if (isScrollbarVisible) {
-            delay(1500)
+            delay(3500)
             if (!gridState.isScrollInProgress && !isDraggingScrollbar) {
                 isScrollbarVisible = false
             }
@@ -4199,11 +4368,13 @@ fun PhotosScreenWithFilters(
             } catch (e: SecurityException) {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     val recoverable = e as? RecoverableSecurityException
-                    recoverable?.let {
+                    if (recoverable != null) {
                         deleteLauncher.launch(
-                            IntentSenderRequest.Builder(it.userAction.actionIntent.intentSender).build()
+                            IntentSenderRequest.Builder(recoverable.userAction.actionIntent.intentSender).build()
                         )
-                    } ?: Toast.makeText(context, msgDeleteError, Toast.LENGTH_SHORT).show()
+                    } else {
+                        Toast.makeText(context, msgDeleteError, Toast.LENGTH_SHORT).show()
+                    }
                 } else {
                     Toast.makeText(context, msgDeleteError, Toast.LENGTH_SHORT).show()
                 }
@@ -4839,6 +5010,7 @@ fun PhotosScreenWithFilters(
 // OBRAZOVKA ALBUMOV (11 ALBUMOV + MORE, TYPY MÉDIÍ BEZ IKON, KÔŠ A SKRYTÝ ALBUM S BIOMETRIOU/PINOM)
 // ----------------------------------------------------
 @OptIn(ExperimentalMaterial3Api::class)
+@android.annotation.SuppressLint("NewApi")
 @Composable
 fun AlbumsScreen(
     allPhotos: List<MediaPhoto>,
@@ -5792,6 +5964,7 @@ fun TextOnlyCategoryTile(
 // ----------------------------------------------------
 // NAČÍTANIE Z PAMÄTE (S PODPOROU PRE SYSTÉMOVÝ KOŠ, DÁTUMY, VEĽKOSŤ A DATA CESTU)
 // ----------------------------------------------------
+@android.annotation.SuppressLint("NewApi")
 suspend fun loadPhotosFromStorage(context: Context): List<MediaPhoto> = withContext(Dispatchers.IO) {
     val photos = mutableListOf<MediaPhoto>()
     val queryUri = MediaStore.Files.getContentUri("external")
@@ -5814,10 +5987,14 @@ suspend fun loadPhotosFromStorage(context: Context): List<MediaPhoto> = withCont
     }
 
     val projection = projectionList.toTypedArray()
-    val selection = "${MediaStore.Files.FileColumns.MEDIA_TYPE} = ? OR ${MediaStore.Files.FileColumns.MEDIA_TYPE} = ?"
+
+    // Pridanie fallback vyhľadávania podľa prípony pre špeciálne formáty (jxl, psd)
+    val selection = "${MediaStore.Files.FileColumns.MEDIA_TYPE} = ? OR ${MediaStore.Files.FileColumns.MEDIA_TYPE} = ? OR ${MediaStore.Files.FileColumns.DATA} LIKE ? OR ${MediaStore.Files.FileColumns.DATA} LIKE ?"
     val selectionArgs = arrayOf(
         MediaStore.Files.FileColumns.MEDIA_TYPE_IMAGE.toString(),
-        MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO.toString()
+        MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO.toString(),
+        "%.jxl",
+        "%.psd"
     )
 
     val sortOrder = "${MediaStore.Files.FileColumns.DATE_ADDED} DESC"
